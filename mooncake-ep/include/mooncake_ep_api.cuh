@@ -15,8 +15,8 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               const int64_t* topk_idx, int* next_clean_buffer, int num_tokens,
               int hidden, int num_max_dispatch_tokens_per_rank, int num_topk,
               int num_experts, int rank, int num_ranks, bool use_fp8,
-              void* workspace, cudaStream_t stream, int64_t timeout_ticks,
-              int phases);
+              void* workspace, int num_device_sms, cudaStream_t stream,
+              int64_t timeout_ticks, int phases);
 
 void combine(void* combined_x, int32_t* active_ranks, void* mxa_buffer,
              int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
@@ -29,7 +29,7 @@ void combine(void* combined_x, int32_t* active_ranks, void* mxa_buffer,
              int num_combined_tokens, int hidden,
              int num_max_dispatch_tokens_per_rank, int num_topk,
              int num_experts, int rank, int num_ranks, void* workspace,
-             cudaStream_t stream, int64_t timeout_ticks, int phases,
-             bool zero_copy);
+             int num_device_sms, cudaStream_t stream, int64_t timeout_ticks,
+             int phases, bool zero_copy);
 
 }  // namespace mooncake
