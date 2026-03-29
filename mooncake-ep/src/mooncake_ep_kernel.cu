@@ -687,11 +687,14 @@ combine(void* combined_x, int32_t* active_ranks,
     }
     cooperative_groups::this_grid().sync();
 
-    // Repartition the receive side into loader/reduction groups before
-    // introducing shared-memory payload staging in a later step.
+    // Rebuild the recv side into a small multi-stage TMA ring with per-group
+    // full/empty mbarriers, while keeping the direct output store.
     constexpr int kMaxRecvGroups = 2;
-    __shared__ int recv_stage_topk_idx[kMaxRecvGroups][kNumMaxTopk];
-    __shared__ float recv_stage_topk_weights[kMaxRecvGroups][kNumMaxTopk];
+    constexpr int kNumStages = 3;
+    constexpr int kNumRecvUnrolls = 2;
+    constexpr size_t kNumTMABufferBytes = 16 + num_bytes_per_slot;
+    constexpr size_t kNumBytesPerGroup = kNumStages * kNumTMABufferBytes;
+    extern __shared__ __align__(16) uint8_t recv_smem_buffer[];
     const auto num_warps = num_threads / 32;
     const int num_recv_groups = min(kMaxRecvGroups, max(1, num_warps / 2));
     const int recv_warps_per_group = num_warps / num_recv_groups;
@@ -703,76 +706,158 @@ combine(void* combined_x, int32_t* active_ranks,
     EP_DEVICE_ASSERT(num_topk <= 32);
     EP_DEVICE_ASSERT(num_recv_groups > 0 and recv_warps_per_group > 1 and
                      num_decode_warps > 0);
-    EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0, "Invalid vectorization");
-    const int decode_thread_idx =
-        (recv_group_warp_idx - 1) * 32 + lane_id;
-    const int num_decode_threads = num_decode_warps * 32;
+    EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0,
+                     "Invalid vectorization");
+    const int warp_base_int4 =
+        (recv_group_warp_idx - 1) * kNumRecvUnrolls * 32;
     const int max_group_iters =
         sm_id >= num_combined_tokens
             ? 0
-            : cell_div(num_combined_tokens - sm_id, num_sms * num_recv_groups);
+            : cell_div(num_combined_tokens - sm_id,
+                       num_sms * num_recv_groups);
+
+    uint8_t* smem_group_buffer = recv_smem_buffer;
+    uint64_t* full_barriers[kNumStages];
+    uint64_t* empty_barriers[kNumStages];
+    uint8_t* tma_ld_buffers[kNumStages];
+    if (recv_group_active) {
+        smem_group_buffer += recv_group_idx * kNumBytesPerGroup;
+        #pragma unroll
+        for (int stage = 0; stage < kNumStages; ++stage) {
+            auto* stage_buffer = smem_group_buffer + stage * kNumTMABufferBytes;
+            full_barriers[stage] =
+                reinterpret_cast<uint64_t*>(stage_buffer);
+            empty_barriers[stage] =
+                reinterpret_cast<uint64_t*>(stage_buffer + 8);
+            tma_ld_buffers[stage] = stage_buffer + 16;
+        }
+    }
+
+    if (recv_group_active && recv_group_warp_idx == 0 && lane_id == 0) {
+        #pragma unroll
+        for (int stage = 0; stage < kNumStages; ++stage) {
+            mbarrier_init(full_barriers[stage], 1);
+            mbarrier_init(empty_barriers[stage], num_decode_warps);
+        }
+        fence_barrier_init();
+    }
+    __syncthreads();
+
+    int stage_idx = 0;
+    uint32_t empty_phase[kNumStages] = {1, 1, 1};
+    uint32_t full_phase[kNumStages] = {0, 0, 0};
 
     for (int iter_idx = 0; iter_idx < max_group_iters; ++iter_idx) {
         const int token_idx =
-            sm_id + num_sms * recv_group_idx + iter_idx * num_sms * num_recv_groups;
-        const bool has_token = recv_group_active && token_idx < num_combined_tokens;
+            sm_id + num_sms * recv_group_idx +
+            iter_idx * num_sms * num_recv_groups;
+        const bool has_token =
+            recv_group_active && token_idx < num_combined_tokens;
 
-        if (recv_group_active and recv_group_warp_idx == 0 and lane_id < num_topk and
-            has_token) {
-            recv_stage_topk_idx[recv_group_idx][lane_id] =
+        if (!recv_group_active)
+            continue;
+
+        int topk_idx_by_lane = -1;
+        float topk_weight_by_lane = 0.0f;
+        if (lane_id < num_topk && has_token) {
+            topk_idx_by_lane =
                 static_cast<int>(__ldg(topk_idx + token_idx * num_topk +
                                        lane_id));
-            recv_stage_topk_weights[recv_group_idx][lane_id] =
-                __ldg(topk_weights + token_idx * num_topk + lane_id);
+            if (recv_group_warp_idx != 0)
+                topk_weight_by_lane = __ldg(topk_weights + token_idx * num_topk +
+                                            lane_id);
         }
-        __syncthreads();
+        __syncwarp();
 
-        if (recv_group_active and recv_group_warp_idx != 0 and has_token) {
-            // Reduction warps: consume staged metadata but keep payload reads on
-            // the existing direct global-memory path for this first skeleton.
-            for (int hidden_idx = decode_thread_idx;
-                 hidden_idx < hidden_bf16_int4;
-                 hidden_idx += num_decode_threads) {
-                float combined_values[kNumElemsPerInt4] = {0.0f};
-                #pragma unroll
-                for (int i = 0; i < num_topk; ++ i) {
-                    const int topk_idx_reg =
-                        recv_stage_topk_idx[recv_group_idx][i];
-                    if (topk_idx_reg < 0)
-                        continue;
+        if (recv_group_warp_idx == 0) {
+            #pragma unroll
+            for (int i = 0; i < kNumMaxTopk; ++i) {
+                const bool topk_in_range = i < num_topk;
+                const int topk_idx_reg =
+                    __shfl_sync(0xffffffff, topk_idx_by_lane, i);
+                const bool valid_topk =
+                    has_token && topk_in_range && topk_idx_reg >= 0 &&
+                    active_ranks[topk_idx_reg / num_local_experts] != 0;
+                if (!valid_topk)
+                    continue;
 
-                    const float topk_weight =
-                        recv_stage_topk_weights[recv_group_idx][i];
-                    auto rdma_buffer_type = reinterpret_cast<const int*>(
-                        reinterpret_cast<uint8_t*>(rdma_recv_data_buffer) +
+                mbarrier_wait(empty_barriers[stage_idx], empty_phase[stage_idx]);
+                if (lane_id == 0) {
+                    auto buffer =
+                        reinterpret_cast<const uint8_t*>(rdma_recv_data_buffer) +
                         (topk_idx_reg * num_max_dispatch_tokens_per_rank +
-                         token_idx) * num_bytes_per_slot);
-                    auto rdma_buffer_row =
-                        reinterpret_cast<const uint8_t*>(rdma_buffer_type);
-                    auto x_vec = ld_nc_global(
-                        reinterpret_cast<const int4*>(rdma_buffer_row) +
-                        hidden_idx);
-                    const auto x_bf16 =
-                        reinterpret_cast<nv_bfloat16*>(&x_vec);
-                    #pragma unroll
-                    for (int j = 0; j < kNumElemsPerInt4; ++ j)
-                        combined_values[j] +=
-                            __bfloat162float(x_bf16[j]) * topk_weight;
+                         token_idx) * num_bytes_per_slot;
+                    tma_load_1d(tma_ld_buffers[stage_idx], buffer,
+                                full_barriers[stage_idx],
+                                static_cast<int>(num_bytes_per_slot));
+                    mbarrier_arrive_and_expect_tx(
+                        full_barriers[stage_idx],
+                        static_cast<int>(num_bytes_per_slot));
                 }
+                __syncwarp();
+                stage_idx = (stage_idx + 1) % kNumStages;
+            }
+        } else {
+            float combined_values[kNumElemsPerInt4 * kNumRecvUnrolls] = {0.0f};
+            #pragma unroll
+            for (int i = 0; i < kNumMaxTopk; ++i) {
+                const bool topk_in_range = i < num_topk;
+                const int topk_idx_reg =
+                    __shfl_sync(0xffffffff, topk_idx_by_lane, i);
+                const bool valid_topk =
+                    has_token && topk_in_range && topk_idx_reg >= 0 &&
+                    active_ranks[topk_idx_reg / num_local_experts] != 0;
+                if (!valid_topk)
+                    continue;
 
-                int4 combined_int4;
-                auto combined_bf16 =
-                    reinterpret_cast<nv_bfloat16*>(&combined_int4);
+                const float topk_weight =
+                    __shfl_sync(0xffffffff, topk_weight_by_lane, i);
+                mbarrier_wait(full_barriers[stage_idx], full_phase[stage_idx]);
+                const auto tma_stage_ptr =
+                    reinterpret_cast<const int4*>(tma_ld_buffers[stage_idx]) +
+                    warp_base_int4;
                 #pragma unroll
-                for (int j = 0; j < kNumElemsPerInt4; ++ j)
-                    combined_bf16[j] =
-                        __float2bfloat16(combined_values[j]);
-                (reinterpret_cast<int4*>(combined_x) +
-                 token_idx * hidden_bf16_int4)[hidden_idx] =
-                    combined_int4;
+                for (int unroll_idx = 0; unroll_idx < kNumRecvUnrolls;
+                     ++unroll_idx) {
+                    const int hidden_idx =
+                        warp_base_int4 + lane_id + unroll_idx * 32;
+                    if (hidden_idx < hidden_bf16_int4) {
+                        const auto x_vec =
+                            tma_stage_ptr[lane_id + unroll_idx * 32];
+                        const auto x_bf16 =
+                            reinterpret_cast<const nv_bfloat16*>(&x_vec);
+                        #pragma unroll
+                        for (int j = 0; j < kNumElemsPerInt4; ++j)
+                            combined_values[unroll_idx * kNumElemsPerInt4 + j] +=
+                                __bfloat162float(x_bf16[j]) * topk_weight;
+                    }
+                }
+                if (lane_id == 0)
+                    mbarrier_arrive(empty_barriers[stage_idx]);
+                stage_idx = (stage_idx + 1) % kNumStages;
+            }
+
+            if (has_token) {
+                auto combined_row = reinterpret_cast<int4*>(combined_x) +
+                    token_idx * hidden_bf16_int4 + warp_base_int4;
+                #pragma unroll
+                for (int unroll_idx = 0; unroll_idx < kNumRecvUnrolls;
+                     ++unroll_idx) {
+                    const int hidden_idx =
+                        warp_base_int4 + lane_id + unroll_idx * 32;
+                    if (hidden_idx < hidden_bf16_int4) {
+                        int4 combined_int4;
+                        auto combined_bf16 =
+                            reinterpret_cast<nv_bfloat16*>(&combined_int4);
+                        #pragma unroll
+                        for (int j = 0; j < kNumElemsPerInt4; ++j)
+                            combined_bf16[j] = __float2bfloat16(
+                                combined_values[unroll_idx * kNumElemsPerInt4 + j]);
+                        combined_row[lane_id + unroll_idx * 32] = combined_int4;
+                    }
+                }
             }
         }
-        __syncthreads();
     }
 }
 
@@ -812,6 +897,21 @@ void combine(void* combined_x, int32_t* active_ranks,
 
 #define COMBINE_LAUNCH_CASE(hidden) { \
 auto combine_func = combine<hidden, kNumMaxTopk>; \
+constexpr int kNumStages = 3; \
+constexpr size_t kHiddenBytes = hidden * sizeof(nv_bfloat16); \
+constexpr size_t kNumTMABufferBytes = 16 + kHiddenBytes; \
+constexpr size_t kNumBytesPerGroup = kNumStages * kNumTMABufferBytes; \
+const int num_recv_groups = min(2, max(1, num_warps / 2)); \
+const size_t recv_smem_bytes = \
+    (phases & LOW_LATENCY_RECV_PHASE) == 0 ? 0 : num_recv_groups * kNumBytesPerGroup; \
+if (recv_smem_bytes > 0) { \
+    CUDA_CHECK(cudaFuncSetAttribute( \
+        combine_func, cudaFuncAttributeMaxDynamicSharedMemorySize, \
+        static_cast<int>(recv_smem_bytes))); \
+    CUDA_CHECK(cudaFuncSetAttribute( \
+        combine_func, cudaFuncAttributePreferredSharedMemoryCarveout, 100)); \
+    cfg.dynamicSmemBytes = recv_smem_bytes; \
+} \
 LAUNCH_KERNEL(&cfg, combine_func, \
               combined_x, active_ranks, \
               mxa_buffer, \
