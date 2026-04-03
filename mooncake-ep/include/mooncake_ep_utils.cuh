@@ -1,6 +1,8 @@
 #pragma once
 
 #include <mooncake_ep_exception.cuh>
+#include <type_traits>
+#include <utility>
 
 #define UNROLLED_WARP_COPY(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC,      \
                            ST_FUNC)                                           \
@@ -45,6 +47,16 @@ struct VecInt<8> {
 template <>
 struct VecInt<16> {
     using vec_t = int4;
+};
+
+template <typename FuncT>
+struct PatternVisitor {
+    FuncT func;
+
+    __device__ __host__ explicit PatternVisitor(FuncT&& func)
+        : func(std::forward<FuncT>(func)) {}
+
+    __device__ __host__ auto operator[](const uint32_t& i) { return func(i); }
 };
 
 __device__ __forceinline__ void trap() { asm("trap;"); }
@@ -334,6 +346,7 @@ __device__ __forceinline__ void fence_view_async_shared() {
     asm volatile("fence.proxy.async.shared::cta; \n" ::);
 }
 
+#if MOONCAKE_EP_ENABLE_SM90_FEATURES
 __device__ __forceinline__ void fence_barrier_init() {
     asm volatile("fence.mbarrier_init.release.cluster; \n" ::);
 }
@@ -346,10 +359,19 @@ __device__ __forceinline__ void mbarrier_init(uint64_t *mbar_ptr,
                  "r"(mbar_int_ptr));
 }
 
-__device__ __forceinline__ void mbarrier_wait(uint64_t *mbar_ptr,
-                                              uint32_t &phase) {
+__device__ __forceinline__ void mbarrier_inval(uint64_t *mbar_ptr) {
     auto mbar_int_ptr =
         static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
+    asm volatile("mbarrier.inval.shared::cta.b64 [%0];" ::"r"(mbar_int_ptr));
+}
+
+template <bool kWithMultiStages = false>
+__device__ __forceinline__ void mbarrier_wait(uint64_t *mbar_ptr,
+                                              uint32_t &phase,
+                                              int stage_idx = 0) {
+    auto mbar_int_ptr =
+        static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
+    const auto wait = kWithMultiStages ? ((phase >> stage_idx) & 1U) : phase;
     asm volatile(
         "{\n\t"
         ".reg .pred       P1; \n\t"
@@ -359,8 +381,11 @@ __device__ __forceinline__ void mbarrier_wait(uint64_t *mbar_ptr,
         "bra     LAB_WAIT; \n\t"
         "DONE: \n\t"
         "}" ::"r"(mbar_int_ptr),
-        "r"(phase), "r"(0x989680));
-    phase ^= 1;
+        "r"(wait), "r"(0x989680));
+    if constexpr (kWithMultiStages)
+        phase ^= (1U << stage_idx);
+    else
+        phase ^= 1U;
 }
 
 __device__ __forceinline__ void mbarrier_arrive_and_expect_tx(
@@ -415,14 +440,20 @@ template <int N = 0>
 __device__ __forceinline__ void tma_store_wait() {
     asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(N) : "memory");
 }
+#endif
 
 template <typename dtype_t>
-__host__ __device__ dtype_t cell_div(dtype_t a, dtype_t b) {
+__host__ __device__ constexpr dtype_t cell_div(dtype_t a, dtype_t b) {
     return (a + b - 1) / b;
 }
 
 template <typename dtype_t>
-__host__ __device__ dtype_t align(dtype_t a, dtype_t b) {
+__host__ __device__ constexpr dtype_t align(dtype_t a, dtype_t b) {
+    return cell_div<dtype_t>(a, b) * b;
+}
+
+template <typename dtype_t>
+__host__ __device__ constexpr dtype_t align_up(dtype_t a, dtype_t b) {
     return cell_div<dtype_t>(a, b) * b;
 }
 
@@ -490,6 +521,24 @@ __forceinline__ __device__ int get_lane_id() {
     int lane_id;
     asm("mov.s32 %0, %laneid;" : "=r"(lane_id));
     return lane_id;
+}
+
+__device__ __forceinline__ uint32_t elect_one_sync() {
+#if MOONCAKE_EP_ENABLE_SM90_DEVICE_FEATURES
+    uint32_t pred = 0;
+    asm volatile(
+        "{\n"
+        ".reg .b32 %%rx;\n"
+        ".reg .pred %%px;\n"
+        "      elect.sync %%rx|%%px, %1;\n"
+        "@%%px mov.s32 %0, 1;\n"
+        "}\n"
+        : "+r"(pred)
+        : "r"(0xffffffff));
+    return pred;
+#else
+    return get_lane_id() == 0;
+#endif
 }
 
 template <int kNumRanks>

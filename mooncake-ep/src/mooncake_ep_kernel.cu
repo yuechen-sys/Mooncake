@@ -544,9 +544,23 @@ combine(void* combined_x, int32_t* active_ranks,
     const auto sub_warp_id = warp_id % kNumWarpsPerGroup;
     const auto responsible_expert_idx = sm_id * kNumWarpGroups + warp_group_id;
 
+    extern __shared__ __align__(1024) uint8_t smem_buffer[];
+
     // Data type staffs
     constexpr int kNumElemsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
     const size_t hidden_bf16_int4 = kHidden / kNumElemsPerInt4;
+
+#if MOONCAKE_EP_ENABLE_SM90_DEVICE_FEATURES
+    // Use different unroll factors for send and recv phases
+    constexpr int kNumMaxUnrolls = 4;
+    constexpr int kNumSendUnrolls = kHidden % (32 * 4 * sizeof(int4) / sizeof(nv_bfloat16)) == 0 ? 4 : 2;
+    constexpr int kNumRecvUnrolls = 2;
+    constexpr int hidden_bf16_int4_pad = align_up(static_cast<int>(hidden_bf16_int4), 32 * kNumSendUnrolls);
+    EP_STATIC_ASSERT(kHidden % (32 * 2 * sizeof(int4) / sizeof(nv_bfloat16)) == 0, "Invalid hidden");
+    EP_STATIC_ASSERT(kNumSendUnrolls <= kNumMaxUnrolls and kNumRecvUnrolls <= kNumMaxUnrolls, "Invalid unrolls");
+    EP_STATIC_ASSERT(hidden_bf16_int4 % kNumSendUnrolls == 0, "Invalid hidden");
+    EP_STATIC_ASSERT(kNumSendUnrolls >= kNumRecvUnrolls, "Invalid unroll factors");
+#endif
 
     // Message package
     constexpr size_t num_bytes_per_slot = kHidden * sizeof(nv_bfloat16);
@@ -590,6 +604,37 @@ combine(void* combined_x, int32_t* active_ranks,
         int offset, num_tokens_to_send;
         unpack2(layout, num_tokens_to_send, offset);
 
+#if MOONCAKE_EP_ENABLE_SM90_DEVICE_FEATURES
+        // TMA stuffs
+        constexpr int kNumTMABufferBytes = sizeof(int4) * 32 * kNumSendUnrolls;
+        constexpr int kNumStages = 3;
+        constexpr int kNumPrefetch = 1;
+        EP_STATIC_ASSERT(kNumStages == 3 and kNumPrefetch == 1, "Invalid stages");
+
+        auto smem_ptr = smem_buffer + warp_id * (kNumStages * (kNumTMABufferBytes + 16));
+        uint32_t tma_phase = 0;
+        auto tma_buffers = PatternVisitor([=](const int& i) { return reinterpret_cast<int4*>(smem_ptr + i * (kNumTMABufferBytes + 16)); });
+        auto full_barriers = PatternVisitor(
+            [=](const int& i) { return reinterpret_cast<uint64_t*>(smem_ptr + i * (kNumTMABufferBytes + 16) + kNumTMABufferBytes); });
+        EP_STATIC_ASSERT(kNumSendUnrolls * kNumStages <= 12, "TMA buffer size exceed limit");
+
+        // Initialize m-barriers
+        if (lane_id < kNumStages) {
+            mbarrier_init(full_barriers[lane_id], 1);
+            fence_barrier_init();
+        }
+        __syncwarp();
+
+        constexpr int kNumIters = hidden_bf16_int4_pad / (32 * kNumSendUnrolls);
+        auto tma_load_and_arrive = [&](const int& stage_idx, const int4* gmem_ptr, const int& num_bytes) {
+            tma_load_1d(tma_buffers[stage_idx], gmem_ptr, full_barriers[stage_idx], num_bytes);
+            mbarrier_arrive_and_expect_tx(full_barriers[stage_idx], num_bytes);
+        };
+        auto get_num_tma_bytes = [&](const int& offset_int4) {
+            return min(kNumTMABufferBytes, static_cast<int>((hidden_bf16_int4 - offset_int4) * sizeof(int4)));
+        };
+#endif
+
         // Issue IBGDA send
         for (int token_idx = offset + sub_warp_id; token_idx < offset + num_tokens_to_send; token_idx += kNumWarpsPerGroup) {
             const auto x_int4 = local_x + token_idx * hidden_bf16_int4;
@@ -600,32 +645,80 @@ combine(void* combined_x, int32_t* active_ranks,
             auto src_idx = __ldg(local_src_info + token_idx);
             const auto buf_ptr = reinterpret_cast<int64_t>(rdma_send_x_vec_row);
             const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_data_buffer) + (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot;
+            bool use_nvlink = nvlink_available[dst_rank] != 0;
+#if MOONCAKE_EP_ENABLE_SM90_DEVICE_FEATURES
+            auto dst_p2p_ptr = dst_rank == rank
+                                   ? reinterpret_cast<int4*>(dst_ptr)
+                                   : (use_nvlink
+                                          ? reinterpret_cast<int4*>(
+                                                static_cast<char*>(ipc_peer_ptrs[dst_rank]) +
+                                                (reinterpret_cast<char*>(dst_ptr) - reinterpret_cast<char*>(mxa_buffer)))
+                                          : nullptr);
+
+            if (not zero_copy or dst_p2p_ptr != nullptr) {
+                const auto cpy_src_int4_ptr = zero_copy ? reinterpret_cast<int4*>(buf_ptr) : x_int4;
+                const auto cpy_dst_int4_ptr =
+                    dst_p2p_ptr == nullptr ? reinterpret_cast<int4*>(buf_ptr) : dst_p2p_ptr;
+
+                if (elect_one_sync())
+                    tma_load_and_arrive(0, cpy_src_int4_ptr, get_num_tma_bytes(0));
+                __syncwarp();
+
+                #pragma unroll
+                for (int i = lane_id * kNumSendUnrolls, iter_idx = 0; i < hidden_bf16_int4_pad; i += 32 * kNumSendUnrolls, ++iter_idx) {
+                    const int& stage_idx = iter_idx % kNumStages;
+                    const int& next_stage_idx = (iter_idx + 1) % kNumStages;
+                    if (iter_idx + 1 < kNumIters and elect_one_sync()) {
+                        tma_store_wait<kNumStages - kNumPrefetch - 1>();
+                        const auto& offset_int4 = i + 32 * kNumSendUnrolls;
+                        tma_load_and_arrive(next_stage_idx, cpy_src_int4_ptr + offset_int4, get_num_tma_bytes(offset_int4));
+                    }
+                    __syncwarp();
+
+                    EP_STATIC_ASSERT(kNumStages < 32, "Too many stages");
+                    mbarrier_wait<true>(full_barriers[stage_idx], tma_phase, stage_idx);
+                    if (elect_one_sync())
+                        tma_store_1d(tma_buffers[stage_idx], cpy_dst_int4_ptr + i, get_num_tma_bytes(i));
+                    __syncwarp();
+                }
+
+                tma_store_wait<0>();
+                __syncwarp();
+            }
+
+            if (dst_p2p_ptr == nullptr && lane_id == 0) {
+                uint64_t req_rptr_actual = raddr_array[dst_rank] + (reinterpret_cast<char*>(dst_ptr) - reinterpret_cast<char*>(mxa_buffer));
+                auto ctx = ctx_array + dst_rank * num_qp_per_rank + local_expert_idx % num_qp_per_rank;
+                device_mutex_lock_system(&ctx->mutex);
+                __mlx5gda_device_write_rdma_write_wqe(ctx, static_cast<uint64_t>(buf_ptr), device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]), num_bytes_per_slot);
+                __mlx5gda_device_post_send_db(ctx);
+                device_mutex_unlock_system(&ctx->mutex);
+            }
+#else
             if (dst_rank == rank) {
                 const auto dst_int4_ptr = reinterpret_cast<int4*>(dst_ptr);
                 UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, ld_nc_global, st_na_global);
+            } else if (use_nvlink) {
+                size_t offset = reinterpret_cast<char*>(dst_ptr) - reinterpret_cast<char*>(mxa_buffer);
+                void* peer_dst_ptr = static_cast<char*>(ipc_peer_ptrs[dst_rank]) + offset;
+                const auto dst_int4_ptr = reinterpret_cast<int4*>(peer_dst_ptr);
+                UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, ld_nc_global, st_na_global);
             } else {
-                bool use_nvlink = nvlink_available[dst_rank] != 0;
-                if (use_nvlink) {
-                    size_t offset = (char *)dst_ptr - (char *)(mxa_buffer);
-                    void* peer_dst_ptr = (char *)ipc_peer_ptrs[dst_rank] + offset;
-                    const auto dst_int4_ptr = reinterpret_cast<int4*>(peer_dst_ptr);
-                    UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, ld_nc_global, st_na_global);
-                } else {
-                    const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
-                    if (not zero_copy)
-                        UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, ld_nc_global, st_na_global);
-                    __syncwarp();
+                const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
+                if (not zero_copy)
+                    UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, ld_nc_global, st_na_global);
+                __syncwarp();
 
-                    if (lane_id == 0) {
-                        uint64_t req_rptr_actual = raddr_array[dst_rank] + ((char *)dst_ptr - (char *)(mxa_buffer));
-                        auto ctx = ctx_array + dst_rank * num_qp_per_rank + local_expert_idx % num_qp_per_rank;
-                        device_mutex_lock_system(&ctx->mutex);
-                        __mlx5gda_device_write_rdma_write_wqe(ctx, (uint64_t) buf_ptr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]), num_bytes_per_slot);
-                        __mlx5gda_device_post_send_db(ctx);
-                        device_mutex_unlock_system(&ctx->mutex);
-                    }
+                if (lane_id == 0) {
+                    uint64_t req_rptr_actual = raddr_array[dst_rank] + (reinterpret_cast<char*>(dst_ptr) - reinterpret_cast<char*>(mxa_buffer));
+                    auto ctx = ctx_array + dst_rank * num_qp_per_rank + local_expert_idx % num_qp_per_rank;
+                    device_mutex_lock_system(&ctx->mutex);
+                    __mlx5gda_device_write_rdma_write_wqe(ctx, static_cast<uint64_t>(buf_ptr), device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]), num_bytes_per_slot);
+                    __mlx5gda_device_post_send_db(ctx);
+                    device_mutex_unlock_system(&ctx->mutex);
                 }
             }
+#endif
         }
 
         // Put finishing flag
@@ -655,6 +748,15 @@ combine(void* combined_x, int32_t* active_ranks,
             atomic_add_release_global(atomic_clean_flag, -1);
         }
         __syncwarp();
+
+#if MOONCAKE_EP_ENABLE_SM90_DEVICE_FEATURES
+        // Destroy m-barriers
+        if (lane_id < kNumStages) {
+            mbarrier_inval(full_barriers[lane_id]);
+            fence_barrier_init();
+        }
+        __syncwarp();
+#endif
     }
 
     // Receiving phase
@@ -747,8 +849,26 @@ void combine(void* combined_x, int32_t* active_ranks,
     EP_HOST_ASSERT(sizeof(int) <= NUM_WORKSPACE_BYTES);
     EP_HOST_ASSERT(num_topk <= kNumMaxTopk);
 
+#if MOONCAKE_EP_ENABLE_SM90_HOST_FEATURES
+    constexpr int kNumStages = 3;
+    constexpr int kNumMaxUnrolls = 4;
+    constexpr int kMaxNumGroups = 2;
+
+    // Send buffer size
+    const int num_send_tma_bytes = 32 * sizeof(int4) * kNumMaxUnrolls + 16;
+    const int smem_send_size = num_warps * (kNumStages * num_send_tma_bytes);
+
+    // Receive buffer size
+    const int num_recv_tma_bytes = 16 + hidden * 2;
+    const int smem_recv_size = kMaxNumGroups * (kNumStages * num_recv_tma_bytes + hidden * 2);
+
+    // Total requirement
+    const int smem_size = max(smem_send_size, smem_recv_size);
+#endif
+
 #define COMBINE_LAUNCH_CASE(hidden) { \
 auto combine_func = combine<kNumWarpGroups, kNumWarpsPerGroup, hidden, kNumMaxTopk>; \
+SET_SHARED_MEMORY_FOR_TMA(combine_func); \
 LAUNCH_KERNEL(&cfg, combine_func, \
               combined_x, active_ranks, \
               mxa_buffer, \
