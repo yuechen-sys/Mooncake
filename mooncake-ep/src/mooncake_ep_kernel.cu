@@ -516,6 +516,17 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
 #undef DISPATCH_LAUNCH_CASE
 }
 
+template <int kNumRecvUnrolls>
+__forceinline__ __device__ void decode_and_accumulate_bf16(
+    const uint32_t* ld_buffer, float* accum, const float weight) {
+    #pragma unroll
+    for (int k = 0; k < kNumRecvUnrolls * 4; ++k) {
+        auto bf16_pack = *reinterpret_cast<const __nv_bfloat162*>(ld_buffer + k);
+        accum[k * 2 + 0] += __bfloat162float(bf16_pack.x) * weight;
+        accum[k * 2 + 1] += __bfloat162float(bf16_pack.y) * weight;
+    }
+}
+
 template <int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden, int kNumMaxTopk>
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
 combine(void* combined_x, int32_t* active_ranks,
@@ -783,12 +794,128 @@ combine(void* combined_x, int32_t* active_ranks,
     }
     cooperative_groups::this_grid().sync();
 
-    // Reduce tokens with FP8 cast
+#if MOONCAKE_EP_ENABLE_SM90_DEVICE_FEATURES
+    constexpr int kMaxNumGroups = 2;
+    const int num_decode_warps = hidden_bf16_int4_pad / (kNumRecvUnrolls * 32);
+    const int num_groups = min(kMaxNumGroups, (num_threads / 32) / (num_decode_warps + 1));
+    const int decode_warp_idx = __shfl_sync(0xffffffff, warp_id % (num_decode_warps + 1), 0);
+    const int group_idx = __shfl_sync(0xffffffff, warp_id / (num_decode_warps + 1), 0);
+    EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0, "Invalid vectorization");
+    EP_DEVICE_ASSERT(num_topk <= 32);
+    EP_DEVICE_ASSERT(num_groups > 0);
+
+    if (group_idx < num_groups) {
+        constexpr int kNumStages = 3;
+        constexpr int kNumTMABufferBytes = 16 * 2 + kHidden * 2;
+        constexpr int kNumBF16PerWarpBytes = 32 * kNumRecvUnrolls * kNumElemsPerInt4 * sizeof(nv_bfloat16);
+        constexpr int kNumBytesPerGroup = kNumStages * kNumTMABufferBytes + kHidden * sizeof(nv_bfloat16);
+
+        const auto smem_group_buffer = smem_buffer + kNumBytesPerGroup * group_idx;
+        auto full_barriers =
+            PatternVisitor([=](const int& i) { return reinterpret_cast<uint64_t*>(smem_group_buffer + i * kNumTMABufferBytes); });
+        auto empty_barriers = PatternVisitor([=](const int& i) {
+            return reinterpret_cast<uint64_t*>(smem_group_buffer + i * kNumTMABufferBytes + 8);
+        });
+        auto tma_ld_buffers = PatternVisitor([=](const int& i) {
+            return reinterpret_cast<uint8_t*>(smem_group_buffer + i * kNumTMABufferBytes + 16);
+        });
+        auto tma_st_buffers = PatternVisitor([=](const int& i) {
+            return reinterpret_cast<uint32_t*>(smem_group_buffer + kNumStages * kNumTMABufferBytes + i * kNumBF16PerWarpBytes);
+        });
+        uint32_t tma_phase = 0;
+        EP_STATIC_ASSERT(kNumStages < 32, "Too many stages");
+        if (decode_warp_idx == num_decode_warps)
+            tma_phase = (1u << kNumStages) - 1u;
+
+        if (decode_warp_idx == num_decode_warps && lane_id < kNumStages) {
+            mbarrier_init(full_barriers[lane_id], 1);
+            mbarrier_init(empty_barriers[lane_id], num_decode_warps);
+        }
+        if (decode_warp_idx == num_decode_warps && lane_id == 0)
+            fence_barrier_init();
+        asm volatile("bar.sync %0, %1;" ::"r"(group_idx + 1), "r"((num_decode_warps + 1) * 32));
+
+        int stage_idx = 0, topk_idx_by_lane = 0;
+        if (decode_warp_idx == num_decode_warps) {
+            for (int token_idx = sm_id + num_sms * group_idx; token_idx < num_combined_tokens; token_idx += num_sms * num_groups) {
+                if (lane_id < num_topk)
+                    topk_idx_by_lane = static_cast<int>(__ldg(topk_idx + token_idx * num_topk + lane_id));
+                for (int i = 0; i < num_topk; ++i) {
+                    const int topk_idx_reg = __shfl_sync(0xffffffff, topk_idx_by_lane, i);
+                    if (topk_idx_reg < 0)
+                        continue;
+                    if (!active_ranks[topk_idx_reg / num_local_experts])
+                        continue;
+
+                    mbarrier_wait<true>(empty_barriers[stage_idx], tma_phase, stage_idx);
+                    auto buffer = reinterpret_cast<uint8_t*>(rdma_recv_data_buffer) +
+                        (topk_idx_reg * num_max_dispatch_tokens_per_rank + token_idx) * num_bytes_per_slot;
+                    if (elect_one_sync()) {
+                        tma_load_1d(tma_ld_buffers[stage_idx], buffer, full_barriers[stage_idx], static_cast<int>(num_bytes_per_slot));
+                        mbarrier_arrive_and_expect_tx(full_barriers[stage_idx], static_cast<int>(num_bytes_per_slot));
+                    }
+                    __syncwarp();
+                    stage_idx = (stage_idx + 1) % kNumStages;
+                }
+            }
+        } else {
+            float topk_weights_by_lane = 0.0f;
+            for (int token_idx = sm_id + num_sms * group_idx; token_idx < num_combined_tokens; token_idx += num_sms * num_groups) {
+                if (lane_id < num_topk) {
+                    topk_idx_by_lane = static_cast<int>(__ldg(topk_idx + token_idx * num_topk + lane_id));
+                    topk_weights_by_lane = __ldg(topk_weights + token_idx * num_topk + lane_id);
+                }
+                __syncwarp();
+
+                float combined_values[kNumElemsPerInt4 * kNumRecvUnrolls] = {0.0f};
+                for (int i = 0; i < num_topk; ++i) {
+                    const int topk_idx_reg = __shfl_sync(0xffffffff, topk_idx_by_lane, i);
+                    if (topk_idx_reg < 0)
+                        continue;
+                    if (!active_ranks[topk_idx_reg / num_local_experts])
+                        continue;
+                    const auto topk_weight = __shfl_sync(0xffffffff, topk_weights_by_lane, i);
+
+                    mbarrier_wait<true>(full_barriers[stage_idx], tma_phase, stage_idx);
+                    const int tma_offset = kNumBF16PerWarpBytes * decode_warp_idx;
+                    decode_and_accumulate_bf16<kNumRecvUnrolls>(
+                        reinterpret_cast<const uint32_t*>(
+                            tma_ld_buffers[stage_idx] + tma_offset + kNumBF16PerWarpBytes / 32 * lane_id),
+                        combined_values,
+                        topk_weight);
+
+                    if (elect_one_sync())
+                        mbarrier_arrive(empty_barriers[stage_idx]);
+                    stage_idx = (stage_idx + 1) % kNumStages;
+                }
+
+                tma_store_wait<0>();
+
+                #pragma unroll
+                for (int k = 0; k < kNumRecvUnrolls * 4; ++k) {
+                    auto combined_pack = __nv_bfloat162(__float2bfloat16(combined_values[k * 2]),
+                                                        __float2bfloat16(combined_values[k * 2 + 1]));
+                    tma_st_buffers[decode_warp_idx][kNumRecvUnrolls * 4 * lane_id + k] =
+                        *reinterpret_cast<uint32_t*>(&combined_pack);
+                }
+                tma_store_fence();
+                if (elect_one_sync()) {
+                    tma_store_1d(tma_st_buffers[decode_warp_idx],
+                                 reinterpret_cast<int4*>(combined_x) +
+                                     token_idx * hidden_bf16_int4 + decode_warp_idx * kNumRecvUnrolls * 32,
+                                 kNumBF16PerWarpBytes);
+                }
+                __syncwarp();
+            }
+            tma_store_wait<0>();
+        }
+    }
+#else
+    // Reduce tokens with direct global-memory rereads on pre-Hopper targets.
     EP_DEVICE_ASSERT(num_topk <= 32 and hidden_bf16_int4 <= num_threads);
     EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0, "Invalid vectorization");
     if (thread_id < hidden_bf16_int4) {
         for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
-            // Read top-k indices and weights
             int reg_topk_idx[kNumMaxTopk];
             float reg_topk_weights[kNumMaxTopk];
             #pragma unroll
@@ -800,11 +927,9 @@ combine(void* combined_x, int32_t* active_ranks,
             float combined_values[kNumElemsPerInt4] = {0.0f};
             #pragma unroll
             for (int i = 0; i < num_topk; ++ i) if (reg_topk_idx[i] >= 0) {
-                // Read from sources
                 auto rdma_buffer_type = reinterpret_cast<const int*>(reinterpret_cast<uint8_t*>(rdma_recv_data_buffer) + (reg_topk_idx[i] * num_max_dispatch_tokens_per_rank + token_idx) * num_bytes_per_slot);
                 auto rdma_buffer_row = reinterpret_cast<const uint8_t*>(rdma_buffer_type);
 
-                // Reduce
                 auto x_vec = ld_nc_global(reinterpret_cast<const int4*>(rdma_buffer_row) + thread_id);
                 const auto x_bf16 = reinterpret_cast<nv_bfloat16*>(&x_vec);
                 #pragma unroll
@@ -812,7 +937,6 @@ combine(void* combined_x, int32_t* active_ranks,
                     combined_values[j] += __bfloat162float(x_bf16[j]) * reg_topk_weights[i];
             }
 
-            // Write results
             int4& combined_int4 = *reinterpret_cast<int4*>(combined_values);
             auto combined_bf16 = reinterpret_cast<nv_bfloat16*>(&combined_values);
             #pragma unroll
@@ -821,6 +945,7 @@ combine(void* combined_x, int32_t* active_ranks,
             (reinterpret_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4)[thread_id] = combined_int4;
         }
     }
+#endif
 }
 
 void combine(void* combined_x, int32_t* active_ranks,
@@ -859,7 +984,7 @@ void combine(void* combined_x, int32_t* active_ranks,
     const int smem_send_size = num_warps * (kNumStages * num_send_tma_bytes);
 
     // Receive buffer size
-    const int num_recv_tma_bytes = 16 + hidden * 2;
+    const int num_recv_tma_bytes = 16 * 2 + hidden * 2;
     const int smem_recv_size = kMaxNumGroups * (kNumStages * num_recv_tma_bytes + hidden * 2);
 
     // Total requirement
