@@ -67,6 +67,9 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     CUDA_CHECK(cudaGetDevice(&device_id));
     CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate,
                                       device_id));
+    cudaDeviceProp device_prop = {};
+    CUDA_CHECK(cudaGetDeviceProperties(&device_prop, device_id));
+    num_device_sms = device_prop.multiProcessorCount;
 
     // Allocate gdr_buffer. On MNNVL clusters, use cuMemCreate with a fabric
     // handle so the buffer is accessible cross-node via NVLink fabric.
@@ -290,8 +293,8 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             qp_devctxs, nvlink_available, ipc_peer_ptrs, x.data_ptr(),
             topk_idx.data_ptr<int64_t>(), next_buffer.rdma_recv_signal_buffer,
             num_tokens, hidden, num_max_dispatch_tokens_per_rank, num_topk,
-            num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
-            timeout_ticks, phases);
+            num_experts, rank, num_ranks, num_device_sms, use_fp8, workspace,
+            launch_stream, timeout_ticks, phases);
     };
     launcher(return_recv_hook
                  ? LOW_LATENCY_SEND_PHASE
@@ -401,8 +404,8 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             layout_range.data_ptr<int64_t>(),
             next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
-            num_ranks, workspace, launch_stream, timeout_ticks, phases,
-            zero_copy);
+            num_ranks, num_device_sms, workspace, launch_stream,
+            timeout_ticks, phases, zero_copy);
     };
     launcher(return_recv_hook
                  ? LOW_LATENCY_SEND_PHASE

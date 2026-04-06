@@ -14,7 +14,8 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               void* const* ipc_peer_ptrs, const void* x,
               const int64_t* topk_idx, int* next_clean_buffer, int num_tokens,
               int hidden, int num_max_dispatch_tokens_per_rank, int num_topk,
-              int num_experts, int rank, int num_ranks, bool use_fp8,
+              int num_experts, int rank, int num_ranks, int num_device_sms,
+              bool use_fp8,
               void* workspace, cudaStream_t stream, int64_t timeout_ticks,
               int phases);
 
@@ -28,7 +29,8 @@ void combine(void* combined_x, int32_t* active_ranks, void* mxa_buffer,
              const int64_t* layout_range, int* next_clean_buffer,
              int num_combined_tokens, int hidden,
              int num_max_dispatch_tokens_per_rank, int num_topk,
-             int num_experts, int rank, int num_ranks, void* workspace,
+             int num_experts, int rank, int num_ranks, int num_device_sms,
+             void* workspace,
              cudaStream_t stream, int64_t timeout_ticks, int phases,
              bool zero_copy);
 

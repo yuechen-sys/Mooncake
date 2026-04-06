@@ -65,6 +65,7 @@ struct MooncakeEpBuffer {
     int device_id;
     int rank, num_ranks;
     int clock_rate_khz;
+    int num_device_sms;
 
     // MXA Buffer
     int buffer_idx{};
